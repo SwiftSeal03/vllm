@@ -2,6 +2,7 @@ import time
 
 import numpy as np
 import pandas as pd
+import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
@@ -9,7 +10,7 @@ from vllm import SamplingParams
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.llm_engine import LLMEngine
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import Counter
+from vllm.sequence import ExecuteModelRequest
 
 engine = None
 
@@ -33,6 +34,7 @@ def add_req_toks(
   )
 
 def bench_normal():
+  print("Starting normal benchmark")
   ntoks = [x * 128 for x in range(1, 32)]
   bszs = [1, 2, 4, 8]
   
@@ -54,18 +56,23 @@ def bench_normal():
     for k in range(0, 3):
       for j in range(bsz):
         add_req_toks(req_ids[j], tokenss[j])
-      start = time.time()
+        
+      start = time.perf_counter()
+      
       engine.step()
-      middle = time.time()
+      
+      middle = time.perf_counter()
+      
       for _ in range(10):
         engine.step()
-      end = time.time()
+        
+      end = time.perf_counter()
+      
       engine.abort_request(req_ids)
       if k > 0:
         pref_time.append(middle - start)
         dec_time.append((end - middle)/10)
         
-    print(dec_time)
     pref_times.append(np.mean(np.array(pref_time)))
     dec_times.append(np.mean(np.array(dec_time)))
     
@@ -76,7 +83,9 @@ def bench_normal():
   dframe.to_csv("decode.csv", index=False)
   
 def bench_chunk():
+  print("Starting chunk benchmark")
   engine.scheduler.scheduler_config.chunked_prefill_enabled = True
+  old_max_num_batched_tokens = engine.scheduler.scheduler_config.max_num_batched_tokens
   strides = [x * 128 for x in range(1, 9)]
   ntok = 4096
   tokens = list(np.random.randint(0, 1000, ntok))
@@ -87,14 +96,17 @@ def bench_chunk():
   for stride in tqdm(strides):
     engine.scheduler.scheduler_config.max_num_batched_tokens = stride
     niter = ntok // stride
-    print("stride", stride, "niter", niter)
     test_times = [[] for _ in range(niter)]
     for k in range(3):
       add_req_toks("0", tokens)
       for j in range(niter):
         start = time.perf_counter()
+        
         engine.step()
+        
+        torch.cuda.synchronize()
         end = time.perf_counter()
+        
         if k > 0:
           test_times[j].append(end - start)
       engine.abort_request("0")
@@ -108,7 +120,61 @@ def bench_chunk():
   frame.to_csv("chunk.csv", index=False)
   
   engine.scheduler.scheduler_config.chunked_prefill_enabled = False
-        
+  engine.scheduler.scheduler_config.max_num_batched_tokens = old_max_num_batched_tokens
+  
+def bench_swap():
+  print("Starting swap benchmark")
+  ntoks = [x * 128 for x in range(1, 32)]
+  
+  # Initialize a request and prefill
+  tokens = list(np.random.randint(0, 1000, ntoks[-1]))
+  add_req_toks("0", tokens)
+  engine.step()
+  
+  # Get physical block ids of the request
+  seq_id = engine.scheduler.running[0].get_seqs()[0].seq_id
+  gpu_blk_ids = [blk.block_number for blk in engine.scheduler.block_manager.block_tables[seq_id]]
+  cpu_blk_ids = list(range(len(gpu_blk_ids)))
+  
+  swap_in_mapping = list(zip(cpu_blk_ids, gpu_blk_ids))
+  swap_out_mapping = list(zip(gpu_blk_ids, cpu_blk_ids))
+  
+  si_times = []
+  so_times = []
+  for ntok in tqdm(ntoks):
+    # We should bypass scheduler/block_manager and directly call the executor
+    nblk = ntok // engine.scheduler.cache_config.block_size
+
+    swap_out_req = ExecuteModelRequest(
+      seq_group_metadata_list=[],
+      blocks_to_swap_out=swap_out_mapping[:nblk],
+    )
+    start = time.perf_counter()
+
+    engine.model_executor.execute_model(swap_out_req)
+
+    torch.cuda.synchronize()
+    end = time.perf_counter()
+
+    so_times.append(end - start)
+
+    swap_in_req = ExecuteModelRequest(
+      seq_group_metadata_list=[],
+      blocks_to_swap_in=swap_in_mapping[:nblk],
+    )
+    start = time.perf_counter()
+
+    engine.model_executor.execute_model(swap_in_req)
+
+    torch.cuda.synchronize()
+    end = time.perf_counter()
+
+    si_times.append(end - start)
+    
+  engine.abort_request("0")
+  
+  frame = pd.DataFrame({"ntok": ntoks, "swap_in": si_times, "swap_out": so_times})
+  frame.to_csv("swap.csv", index=False)
 
 if __name__ == "__main__":
   engine_args = EngineArgs(
@@ -124,7 +190,8 @@ if __name__ == "__main__":
   engine = LLMEngine.from_engine_args(
     engine_args, usage_context=UsageContext.LLM_CLASS)
   
-  # bench_normal()
+  bench_normal()
   bench_chunk()
+  bench_swap()
 
   

@@ -818,7 +818,6 @@ class ModelRunner:
             logits=logits,
             sampling_metadata=sampling_metadata,
         )
-        torch.cuda.synchronize()
         return output
 
     @torch.inference_mode()
